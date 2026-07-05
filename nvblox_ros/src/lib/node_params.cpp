@@ -110,6 +110,7 @@ void initializeNvbloxNodeParams(
   initializeBaseNodeParams(node, params, parameter_tree);
 
   initStringParam(node, &params->pose_frame, parameter_tree);
+  initStringParam(node, &params->slice_reference_frame, parameter_tree);
   initStringParam(node, &params->map_clearing_frame_id, parameter_tree);
   initStringParam(node, &params->after_shutdown_map_save_path, parameter_tree);
   initStringParam(

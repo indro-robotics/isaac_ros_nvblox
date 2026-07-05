@@ -46,6 +46,8 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
+#include <atomic>
 #include <visualization_msgs/msg/marker.hpp>
 
 #include <nvblox_msgs/srv/file_path.hpp>
@@ -189,6 +191,12 @@ protected:
   virtual void processPointcloudQueue();
   virtual void processServiceRequestTaskQueue();
   virtual void processEsdf();
+
+  // SKID: make the 2D ESDF slice follow slice_reference_frame in Z. Called at the top of
+  // processEsdf(), before the ESDF is updated. No-op when slice_reference_frame is empty.
+  void updateSliceBoundsFromReferenceFrame();
+  // SKID: publish the current [min, max] slice offsets on the latched ~/slice_bounds/current topic.
+  void publishCurrentSliceBounds();
 
   // Return true if the time between the two passed timestamps is sufficient to trigger an action
   // under the requested rate.
@@ -373,6 +381,17 @@ protected:
   rclcpp::Subscription<geometry_msgs::msg::TransformStamped>::SharedPtr
     transform_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
+
+  // SKID: runtime slice band, as offsets relative to slice_reference_frame's Z (map frame).
+  // Set via the latched ~/slice_bounds topic ([min, max]); seeded from the configured
+  // esdf_slice_min/max_height at startup. Read live in processEsdf().
+  std::atomic<float> slice_min_offset_{0.f};
+  std::atomic<float> slice_max_offset_{1.f};
+  // True once a valid frame-relative band has been applied; until then, with a reference
+  // frame set, the offsets must NOT be used as an absolute map-frame band (see processEsdf).
+  bool slice_frame_applied_{false};
+  rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr slice_bounds_sub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr slice_bounds_current_publisher_;
 
   // Publishers
   std::unique_ptr<LayerPublisher> layer_publisher_;

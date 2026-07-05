@@ -101,6 +101,14 @@ NvbloxNode::NvbloxNode(
   // Initialize the MultiMapper with the underlying dynamic/static mappers.
   initializeMultiMapper();
 
+  // SKID: seed the base_link-relative slice offsets from the configured slice heights, so
+  // the yaml esdf_slice_min/max_height become the initial offsets when slice_reference_frame
+  // is set. Overridden at runtime by the ~/slice_bounds topic.
+  if (static_mapper_) {
+    slice_min_offset_ = static_mapper_->esdf_integrator().esdf_slice_min_height();
+    slice_max_offset_ = static_mapper_->esdf_integrator().esdf_slice_max_height();
+  }
+
   // Setup interactions with ROS
   subscribeToTopics();
   setupTimers();
@@ -353,11 +361,48 @@ void NvbloxNode::subscribeToTopics()
     std::bind(&Transformer::transformCallback, &transformer_, std::placeholders::_1));
   pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
     "pose", 10, std::bind(&Transformer::poseCallback, &transformer_, std::placeholders::_1));
+
+  // SKID: latched slice-band command. Publish [min, max] here to move the (frame-relative)
+  // 2D ESDF slice at runtime; transient_local so a value published before nvblox starts
+  // is still delivered. Runs in group_processing_ so it serializes with processEsdf() under
+  // the MultiThreadedExecutor: the min/max pair is never torn-read mid-tick.
+  rclcpp::SubscriptionOptions slice_bounds_options;
+  slice_bounds_options.callback_group = group_processing_;
+  slice_bounds_sub_ = create_subscription<std_msgs::msg::Float32MultiArray>(
+    "~/slice_bounds", rclcpp::QoS(1).transient_local(),
+    [this](const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
+      if (msg->data.size() < 2) {
+        RCLCPP_WARN(get_logger(), "slice_bounds ignored: expected [min, max], got %zu values",
+          msg->data.size());
+        return;
+      }
+      const float lo = msg->data[0];
+      const float hi = msg->data[1];
+      // Reject inverted bounds: min > max would invert the nvblox slice indices and trip a
+      // CHECK_GE in the core (SIGABRT). Keep the last valid band instead.
+      if (lo > hi) {
+        RCLCPP_WARN(
+          get_logger(), "slice_bounds rejected: min (%.2f) > max (%.2f)", lo, hi);
+        return;
+      }
+      slice_min_offset_ = lo;
+      slice_max_offset_ = hi;
+      publishCurrentSliceBounds();
+      RCLCPP_INFO(
+        get_logger(), "slice_bounds set to [min=%.2f, max=%.2f] (offsets vs %s)",
+        lo, hi, params_.slice_reference_frame.get().c_str());
+    },
+    slice_bounds_options);
 }
 
 void NvbloxNode::advertiseTopics()
 {
   RCLCPP_INFO_STREAM(get_logger(), "NvbloxNode::advertiseTopics()");
+  // SKID: latched readback of the current slice offsets.
+  slice_bounds_current_publisher_ =
+    create_publisher<std_msgs::msg::Float32MultiArray>(
+    "~/slice_bounds/current", rclcpp::QoS(1).transient_local());
+  publishCurrentSliceBounds();
   // Static esdf
   static_esdf_pointcloud_publisher_ =
     create_publisher<sensor_msgs::msg::PointCloud2>("~/static_esdf_pointcloud", 1);
@@ -764,11 +809,63 @@ void NvbloxNode::processServiceRequestTaskQueue()
   }
 }
 
+void NvbloxNode::publishCurrentSliceBounds()
+{
+  if (!slice_bounds_current_publisher_) {return;}
+  std_msgs::msg::Float32MultiArray msg;
+  msg.data = {slice_min_offset_.load(), slice_max_offset_.load()};
+  slice_bounds_current_publisher_->publish(msg);
+}
+
+void NvbloxNode::updateSliceBoundsFromReferenceFrame()
+{
+  const std::string & ref = params_.slice_reference_frame.get();
+  if (ref.empty()) {return;}  // Opt-in: empty => stock absolute-map-frame slice.
+
+  // Do not resolve the band before any depth has been integrated: newest_integrated_depth_time_
+  // is Time(0) then, and a Time(0) TF lookup returns the latest queued transform rather than
+  // failing, which would apply a pre-depth pose. Wait for real data.
+  if (newest_integrated_depth_time_.nanoseconds() == 0) {return;}
+
+  // Time-sync the reference pose to the map data: look it up at the depth-integration time,
+  // not wall-clock, so the band matches what was integrated.
+  Transform T_G_R;
+  if (!transformer_.lookupTransformToGlobalFrame(ref, newest_integrated_depth_time_, &T_G_R)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "slice_reference_frame '%s' TF unavailable at depth time; holding last slice band.",
+      ref.c_str());
+    return;  // Hold the previous band rather than jump.
+  }
+  const float z = T_G_R.translation().z();
+  float lo = z + slice_min_offset_.load();
+  float hi = z + slice_max_offset_.load();
+  if (lo > hi) {std::swap(lo, hi);}  // defensive: never hand nvblox inverted slice bounds
+  auto apply = [lo, hi, z](const std::shared_ptr<Mapper> & mapper) {
+      if (!mapper) {return;}
+      mapper->esdf_integrator().esdf_slice_min_height(lo);
+      mapper->esdf_integrator().esdf_slice_max_height(hi);
+      mapper->esdf_integrator().esdf_slice_height(z);  // draw/report the slice at the frame's Z
+    };
+  apply(static_mapper_);
+  apply(dynamic_mapper_);
+  slice_frame_applied_ = true;
+}
+
 void NvbloxNode::processEsdf()
 {
   const rclcpp::Time timestamp = get_clock()->now();
   timing::Timer ros_esdf_timer("ros/esdf");
   timing::Rates::tick("ros/update_esdf");
+
+  // SKID: move the 2D ESDF slice to slice_reference_frame's Z before the ESDF is computed.
+  updateSliceBoundsFromReferenceFrame();
+
+  // SKID: with a reference frame set, suppress ESDF output until the first valid frame-relative
+  // band is applied (TF + depth ready), so we never emit a wrong absolute-band slice at startup.
+  if (!params_.slice_reference_frame.get().empty() && !slice_frame_applied_) {
+    return;
+  }
 
   timing::Timer esdf_integration_timer("ros/esdf/integrate");
   multi_mapper_->updateEsdf();

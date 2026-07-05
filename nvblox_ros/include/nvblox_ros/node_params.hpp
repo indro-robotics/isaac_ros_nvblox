@@ -52,6 +52,14 @@ constexpr StringParam::Description kPoseFrameParamDesc{
   "interpreted as being in this pose frame, and the remaining transform to the sensor "
   "frame will be looked up on the TF tree."};
 
+constexpr StringParam::Description kSliceReferenceFrameParamDesc{
+  "slice_reference_frame", "",
+  "SKID: if non-empty, the 2D ESDF slice min/max heights are treated as OFFSETS relative "
+  "to the Z of this TF frame (looked up in the global frame at the depth-integration time), "
+  "so the slice follows the frame in Z. The offsets are set at runtime via the latched "
+  "~/slice_bounds topic (Float32MultiArray [min, max]). Empty = absolute map-frame heights "
+  "(stock nvblox behavior)."};
+
 // ======= DATA PROCESSING TOGGLES =======
 constexpr Param<bool>::Description kPublishEsdfDistanceSliceParamDesc{
   "publish_esdf_distance_slice", true,
@@ -318,6 +326,7 @@ public:
 
   Param<CudaStreamType> cuda_stream_type{kCudaStreamTypeParamDesc};
   StringParam pose_frame{kPoseFrameParamDesc};
+  StringParam slice_reference_frame{kSliceReferenceFrameParamDesc};
   StringParam map_clearing_frame_id{kMapClearingFrameIdParamDesc};
   StringParam after_shutdown_map_save_path{kAfterShutdownMapSavePathParamDesc};
   StringParam esdf_slice_bounds_visualization_attachment_frame_id{
