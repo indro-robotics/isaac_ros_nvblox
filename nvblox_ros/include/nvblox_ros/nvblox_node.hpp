@@ -383,13 +383,23 @@ protected:
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
 
   // SKID: runtime slice band, as offsets relative to slice_reference_frame's Z (map frame).
-  // Set via the latched ~/slice_bounds topic ([min, max]); seeded from the configured
-  // esdf_slice_min/max_height at startup. Read live in processEsdf().
-  std::atomic<float> slice_min_offset_{0.f};
-  std::atomic<float> slice_max_offset_{1.f};
+  // Per-mapper pairs: each mapper's band is seeded from its OWN configured
+  // esdf_slice_min/max_height at startup so static and dynamic keep distinct bands
+  // (NVBLOX-PATCH-1). A latched ~/slice_bounds command ([min, max]) OVERRIDES BOTH pairs
+  // identically (explicit operator override). Read live in processEsdf().
+  // NOTE(NVBLOX-PATCH-2): all access is serialized by the MutuallyExclusive group_processing_
+  // callback group (slice_bounds callback + processEsdf run in it under the executor), so
+  // serialization -- not the atomic type -- is the correctness guarantee here; atomics are
+  // retained only to match the existing style.
+  std::atomic<float> static_slice_min_offset_{0.f};
+  std::atomic<float> static_slice_max_offset_{1.f};
+  std::atomic<float> dynamic_slice_min_offset_{0.f};
+  std::atomic<float> dynamic_slice_max_offset_{1.f};
   // True once a valid frame-relative band has been applied; until then, with a reference
   // frame set, the offsets must NOT be used as an absolute map-frame band (see processEsdf).
   bool slice_frame_applied_{false};
+  // Consecutive reference-frame TF-lookup failures; a sustained outage suppresses the slice.
+  int slice_tf_fail_count_{0};
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr slice_bounds_sub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr slice_bounds_current_publisher_;
 

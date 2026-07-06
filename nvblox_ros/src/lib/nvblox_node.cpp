@@ -101,12 +101,17 @@ NvbloxNode::NvbloxNode(
   // Initialize the MultiMapper with the underlying dynamic/static mappers.
   initializeMultiMapper();
 
-  // SKID: seed the base_link-relative slice offsets from the configured slice heights, so
-  // the yaml esdf_slice_min/max_height become the initial offsets when slice_reference_frame
-  // is set. Overridden at runtime by the ~/slice_bounds topic.
+  // SKID: seed each mapper's base_link-relative slice offsets from ITS OWN configured slice
+  // heights, so the per-mapper yaml esdf_slice_min/max_height become the initial offsets when
+  // slice_reference_frame is set (NVBLOX-PATCH-1: static and dynamic keep distinct bands).
+  // A runtime ~/slice_bounds command overrides BOTH pairs.
   if (static_mapper_) {
-    slice_min_offset_ = static_mapper_->esdf_integrator().esdf_slice_min_height();
-    slice_max_offset_ = static_mapper_->esdf_integrator().esdf_slice_max_height();
+    static_slice_min_offset_ = static_mapper_->esdf_integrator().esdf_slice_min_height();
+    static_slice_max_offset_ = static_mapper_->esdf_integrator().esdf_slice_max_height();
+  }
+  if (dynamic_mapper_) {
+    dynamic_slice_min_offset_ = dynamic_mapper_->esdf_integrator().esdf_slice_min_height();
+    dynamic_slice_max_offset_ = dynamic_mapper_->esdf_integrator().esdf_slice_max_height();
   }
 
   // Setup interactions with ROS
@@ -385,8 +390,13 @@ void NvbloxNode::subscribeToTopics()
           get_logger(), "slice_bounds rejected: min (%.2f) > max (%.2f)", lo, hi);
         return;
       }
-      slice_min_offset_ = lo;
-      slice_max_offset_ = hi;
+      // Explicit operator override: a runtime command drives BOTH mappers' bands identically,
+      // superseding the per-mapper seeded offsets (NVBLOX-PATCH-1). Each band is still clamped
+      // independently to the CUDA slice-kernel limit when applied per tick.
+      static_slice_min_offset_ = lo;
+      static_slice_max_offset_ = hi;
+      dynamic_slice_min_offset_ = lo;
+      dynamic_slice_max_offset_ = hi;
       publishCurrentSliceBounds();
       RCLCPP_INFO(
         get_logger(), "slice_bounds set to [min=%.2f, max=%.2f] (offsets vs %s)",
@@ -812,8 +822,10 @@ void NvbloxNode::processServiceRequestTaskQueue()
 void NvbloxNode::publishCurrentSliceBounds()
 {
   if (!slice_bounds_current_publisher_) {return;}
+  // Readback reports the STATIC mapper's offset pair (NVBLOX-PATCH-1). After a runtime
+  // ~/slice_bounds override both mappers carry the same pair, so this remains representative.
   std_msgs::msg::Float32MultiArray msg;
-  msg.data = {slice_min_offset_.load(), slice_max_offset_.load()};
+  msg.data = {static_slice_min_offset_.load(), static_slice_max_offset_.load()};
   slice_bounds_current_publisher_->publish(msg);
 }
 
@@ -831,24 +843,74 @@ void NvbloxNode::updateSliceBoundsFromReferenceFrame()
   // not wall-clock, so the band matches what was integrated.
   Transform T_G_R;
   if (!transformer_.lookupTransformToGlobalFrame(ref, newest_integrated_depth_time_, &T_G_R)) {
-    RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 2000,
-      "slice_reference_frame '%s' TF unavailable at depth time; holding last slice band.",
-      ref.c_str());
-    return;  // Hold the previous band rather than jump.
+    // Hold the previous band across a brief dropout, but do not hold a stale-altitude slice
+    // forever: after a sustained outage (e.g. a cuVSLAM reset while the drone changes Z) stop
+    // trusting it and suppress ESDF output, so the collision shim degrades to blind /
+    // operational=false rather than avoiding at the wrong altitude.
+    constexpr int kMaxSliceTfHoldTicks = 15;
+    if (++slice_tf_fail_count_ > kMaxSliceTfHoldTicks) {
+      slice_frame_applied_ = false;
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "slice_reference_frame '%s' TF lost for >%d ticks; suppressing ESDF slice output",
+        ref.c_str(), kMaxSliceTfHoldTicks);
+    } else {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "slice_reference_frame '%s' TF unavailable at depth time; holding last slice band.",
+        ref.c_str());
+    }
+    return;
   }
+  slice_tf_fail_count_ = 0;   // reference frame recovered
   const float z = T_G_R.translation().z();
-  float lo = z + slice_min_offset_.load();
-  float hi = z + slice_max_offset_.load();
-  if (lo > hi) {std::swap(lo, hi);}  // defensive: never hand nvblox inverted slice bounds
-  auto apply = [lo, hi, z](const std::shared_ptr<Mapper> & mapper) {
+  // Apply each mapper's OWN offset pair at the same frame Z, clamping each band independently
+  // (NVBLOX-PATCH-1). Serialized via group_processing_ (NVBLOX-PATCH-2), so the offset loads
+  // below are consistent within a tick.
+  auto apply = [this, z](
+    const std::shared_ptr<Mapper> & mapper,
+    const std::atomic<float> & min_offset, const std::atomic<float> & max_offset,
+    const char * mapper_label) {
       if (!mapper) {return;}
+      const float req_lo = z + min_offset.load();
+      const float req_hi = z + max_offset.load();
+      float lo = req_lo;
+      float hi = req_hi;
+      if (lo > hi) {std::swap(lo, hi);}  // defensive: never hand nvblox inverted slice bounds
+      // Clamp the vertical band so the ESDF slice kernel stays within the CUDA 1024-thread/block
+      // limit: dim_threads.z = blocks-in-column = floor(hi/bs)-floor(lo/bs)+1, and 8*8*z <= 1024
+      // => z <= 16. A band of 15*block_size spans at most 16 blocks = exactly 1024 threads
+      // (inclusive-safe). A too-wide band (e.g. a stray [-1000, 2] /slice_bounds command) would
+      // fail the markSitesInSlice launch and abort mapping. Clamp with a ONE-SIDED rule that
+      // preserves the near bound (the one closest to the frame Z), so a landed [0, 1000] stays
+      // [z+0, z+12] (ground band above the drone) and an airborne [-1000, 2] stays [z-<band>,
+      // z+2] (ceiling band below the drone). A midpoint recentre would instead push the slab
+      // hundreds of metres away and observe nothing (SLICE-CLAMP-CENTER).
+      const float max_band_m = 15.0f * mapper->esdf_layer().block_size();
+      if (hi - lo > max_band_m) {
+        // Offsets relative to frame Z; anchor whichever bound is nearer to z (offset 0).
+        // Absolute value computed inline to avoid a <cmath> dependency.
+        const float lo_off = lo - z;
+        const float hi_off = hi - z;
+        const float lo_dist = (lo_off < 0.f) ? -lo_off : lo_off;
+        const float hi_dist = (hi_off < 0.f) ? -hi_off : hi_off;
+        if (lo_dist <= hi_dist) {
+          hi = lo + max_band_m;   // anchor low (near) bound
+        } else {
+          lo = hi - max_band_m;   // anchor high (near) bound
+        }
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 5000,
+          "%s slice band [%.2f, %.2f] exceeds %.1f m (CUDA slice-kernel limit); clamped "
+          "(near-bound preserved) to [%.2f, %.2f]",
+          mapper_label, req_lo, req_hi, max_band_m, lo, hi);
+      }
       mapper->esdf_integrator().esdf_slice_min_height(lo);
       mapper->esdf_integrator().esdf_slice_max_height(hi);
       mapper->esdf_integrator().esdf_slice_height(z);  // draw/report the slice at the frame's Z
     };
-  apply(static_mapper_);
-  apply(dynamic_mapper_);
+  apply(static_mapper_, static_slice_min_offset_, static_slice_max_offset_, "static");
+  apply(dynamic_mapper_, dynamic_slice_min_offset_, dynamic_slice_max_offset_, "dynamic");
   slice_frame_applied_ = true;
 }
 
